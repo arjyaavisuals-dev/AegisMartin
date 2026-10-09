@@ -6,18 +6,24 @@ export const dynamic = 'force-dynamic';
 /**
  * Thin proxy to the OSIRIS Intelligence Layer (osiris-intel).
  *
+ * On Vercel: INTEL_URL is injected by the `intel` service binding declared in
+ *            vercel.json (internal URL, resolved at runtime).
  * In Docker: fetches from http://osiris-intel:4000/resolve
  * In dev:    fetches from http://localhost:4000/resolve
  *
- * All intelligence logic lives in the intel container — this route
+ * All intelligence logic lives in the intel service — this route
  * just validates the request and forwards it.
  */
 
-const INTEL_URL = process.env.INTEL_URL || (
-  process.env.NODE_ENV === 'production'
-    ? 'http://osiris-intel:4000'
-    : 'http://localhost:4000'
-);
+// Read at request time: Vercel service bindings resolve at runtime, not build.
+function intelBase(): string {
+  const base = process.env.INTEL_URL || (
+    process.env.NODE_ENV === 'production'
+      ? 'http://osiris-intel:4000'
+      : 'http://localhost:4000'
+  );
+  return base.endsWith('/') ? base : `${base}/`;
+}
 
 const ALLOWED_TYPES = new Set(['aircraft', 'vessel', 'company', 'person', 'ip', 'country']);
 
@@ -48,7 +54,7 @@ export async function GET(req: Request) {
       const val = searchParams.get(key);
       if (val) params.set(key, val);
     }
-    const res = await fetch(`${INTEL_URL}/resolve?${params}`, {
+    const res = await fetch(new URL(`resolve?${params}`, intelBase()), {
       signal: AbortSignal.timeout(15000),
       headers: { 'X-Forwarded-For': clientIp },
     });
