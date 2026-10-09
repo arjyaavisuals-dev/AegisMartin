@@ -13,11 +13,18 @@
  *   - Outbound requests only to allowlisted domains
  *   - SPARQL inputs sanitized against injection
  *   - Rate-limited per client IP
+ *
+ * Runtime:
+ *   - Docker / local: starts its own HTTP server (boot() below).
+ *   - Vercel (services): the Express app is exported and Vercel invokes it;
+ *     no listener and no timers. The sanctions index loads lazily on the
+ *     first request and refreshes on demand once it is older than 24h.
  */
 
 const express = require('express');
 const app = express();
 const PORT = process.env.INTEL_PORT || 4000;
+const ON_VERCEL = !!process.env.VERCEL;
 
 // ════════════════════════════════════════════════════
 // §1 — CONFIGURATION
@@ -27,6 +34,7 @@ const SDN_CSV_URL = 'https://data.opensanctions.org/datasets/latest/us_ofac_sdn/
 const WIKIDATA_ENDPOINT = 'https://query.wikidata.org/sparql';
 const WIKIDATA_UA = 'OSIRIS-Intel/1.0 (https://osirisai.live; ontology engine)';
 const SDN_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h
+const SDN_RETRY_MS = 60 * 1000; // minimum gap between failed load attempts
 const WIKIDATA_CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
 const WIKIDATA_CACHE_MAX = 10_000;
 
@@ -118,6 +126,24 @@ async function loadSanctions() {
       console.log('[INTEL] Keeping stale index');
     }
   }
+}
+
+// Lazy load / on-demand refresh. Used where no long-lived process exists
+// (Vercel) and harmless elsewhere: boot() already loads the index, so this is
+// a no-op until the index is older than SDN_REFRESH_MS.
+let sanctionsLoading = null;
+let sanctionsAttemptAt = 0;
+
+async function ensureSanctions() {
+  const now = Date.now();
+  const stale = now - sanctionsIndex.fetchedAt > SDN_REFRESH_MS;
+  if (stale && !sanctionsLoading && now - sanctionsAttemptAt > SDN_RETRY_MS) {
+    sanctionsAttemptAt = now;
+    sanctionsLoading = loadSanctions().finally(() => { sanctionsLoading = null; });
+  }
+  // The very first load blocks so early requests still get sanctions matches;
+  // later refreshes run in the background while the stale index keeps serving.
+  if (sanctionsLoading && sanctionsIndex.entries.length === 0) await sanctionsLoading;
 }
 
 function sanctionsSearch(query, limit = 5) {
@@ -706,6 +732,7 @@ function isRateLimited(ip, limit = 30, windowMs = 60000) {
 // ════════════════════════════════════════════════════
 
 app.get('/health', (_req, res) => {
+  ensureSanctions(); // kick off a lazy load/refresh without blocking the probe
   res.json({
     status: 'ok',
     sanctions_entries: sanctionsIndex.entries.length,
@@ -733,6 +760,7 @@ app.get('/resolve', async (req, res) => {
   if (id.length < 2) return res.status(400).json({ error: 'ID contains too many invalid characters' });
 
   try {
+    await ensureSanctions();
     const resolver = RESOLVERS[type];
     // Pass extra properties for aircraft resolution (registration, model, etc.)
     const props = {};
@@ -773,4 +801,9 @@ async function boot() {
   });
 }
 
-boot().catch(e => { console.error('[INTEL] Fatal:', e); process.exit(1); });
+// Vercel imports and invokes the exported app; everywhere else we run our own server.
+if (!ON_VERCEL) {
+  boot().catch(e => { console.error('[INTEL] Fatal:', e); process.exit(1); });
+}
+
+module.exports = app;
